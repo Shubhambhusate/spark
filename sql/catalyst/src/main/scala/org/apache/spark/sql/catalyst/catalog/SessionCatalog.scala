@@ -38,7 +38,7 @@ import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FunctionBuilder
 import org.apache.spark.sql.catalyst.analysis.TableFunctionRegistry.TableFunctionBuilder
 import org.apache.spark.sql.catalyst.catalog.SQLFunction.parseDefault
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Expression, ExpressionInfo, LateralSubquery, NamedArgumentExpression, NamedExpression, OuterReference, ScalarSubquery, UpCast}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Expression, ExpressionInfo, LateralSubquery, NamedArgumentExpression, NamedExpression, NamedLambdaVariable, OuterReference, ScalarSubquery, UnresolvedNamedLambdaVariable, UpCast}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{FunctionSignature, InputParameter, LateralJoin, LogicalPlan, NamedParametersSupport, OneRowRelation, Project, SubqueryAlias, View}
@@ -1633,6 +1633,24 @@ class SessionCatalog(
       throw UserDefinedFunctionErrors.notAScalarFunction(function.name.nameParts)
     }
     (input: Seq[Expression]) => {
+      // Check if any input contains a lambda variable - SQL functions cannot be used
+      // inside lambda functions in higher-order functions
+      val lambdaVar = input.flatMap(_.find {
+        case _: NamedLambdaVariable | _: UnresolvedNamedLambdaVariable => true
+        case _ => false
+      }).headOption
+      if (lambdaVar.isDefined) {
+        // Format input expressions, replacing lambda variables with "lambda <name>" format
+        val formattedInputs = input.map {
+          case v: NamedLambdaVariable => s"lambda ${v.name}"
+          case v: UnresolvedNamedLambdaVariable => s"lambda ${v.name}"
+          case e => e.sql
+        }.mkString(", ")
+        throw new AnalysisException(
+          errorClass = "UNSUPPORTED_FEATURE.LAMBDA_FUNCTION_WITH_SQL_UDF",
+          messageParameters = Map(
+            "funcName" -> s"\"${function.name.unquotedString}($formattedInputs)\""))
+      }
       val args = rearrangeArguments(function.inputParam, input, function.name.toString)
       val returnType = function.getScalarFuncReturnType
       SQLFunctionExpression(
@@ -1710,6 +1728,25 @@ class SessionCatalog(
       if (input.size > paramSize) {
         throw QueryCompilationErrors.wrongNumArgsError(
           name, paramSize.toString, input.size)
+      }
+
+      // Check if any input contains a lambda variable - SQL functions cannot be used
+      // inside lambda functions in higher-order functions
+      val lambdaVar = input.flatMap(_.find {
+        case _: NamedLambdaVariable | _: UnresolvedNamedLambdaVariable => true
+        case _ => false
+      }).headOption
+      if (lambdaVar.isDefined) {
+        // Format input expressions, replacing lambda variables with "lambda <name>" format
+        val formattedInputs = input.map {
+          case v: NamedLambdaVariable => s"lambda ${v.name}"
+          case v: UnresolvedNamedLambdaVariable => s"lambda ${v.name}"
+          case e => e.sql
+        }.mkString(", ")
+        throw new AnalysisException(
+          errorClass = "UNSUPPORTED_FEATURE.LAMBDA_FUNCTION_WITH_SQL_UDF",
+          messageParameters = Map(
+            "funcName" -> s"\"${function.name.unquotedString}($formattedInputs)\""))
       }
 
       val inputs = inputParam.map { param =>
